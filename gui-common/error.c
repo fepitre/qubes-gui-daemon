@@ -44,7 +44,7 @@ int dummy_handler(Display * dpy, XErrorEvent * ev)
              ext && ext->codes.major_opcode != ev->request_code;
              ext = ext->next);
         if (ext)
-            strncpy(buf, ext->name, sizeof(buf));
+            memcpy(buf, ext->name, sizeof(buf));
         else
             buf[0] = '\0';
     }
