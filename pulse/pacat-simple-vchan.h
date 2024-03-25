@@ -40,6 +40,11 @@ struct userdata {
     bool never_block;
     bool pending_play_cork;
     bool draining;
+
+    int domid;
+    char *pidfile_path;
+    int pidfile_fd;
+    int play_watch_fd, rec_watch_fd;
 };
 
 void pacat_log(const char *fmt, ...);

@@ -1026,16 +1026,30 @@ static _Noreturn void usage(char *arg0, int arg) {
     exit(arg);
 }
 
+int init_vchan(struct userdata *u) {
+    if (create_pidfile(u->domid, &u->pidfile_path, &u->pidfile_fd) < 0)
+        /* error already printed by create_pidfile() */
+        return -1;
+
+    u->play_ctrl = libvchan_client_init_async(u->domid, QUBES_PA_SINK_VCHAN_PORT, &u->play_watch_fd);
+    if (!u->play_ctrl) {
+        perror("libvchan_client_init_async");
+        return -1;
+    }
+    u->rec_ctrl = libvchan_client_init_async(u->domid, QUBES_PA_SOURCE_VCHAN_PORT, &u->rec_watch_fd);
+    if (!u->rec_ctrl) {
+        perror("libvchan_client_init_async");
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     struct timeval tv;
     struct userdata u;
     pa_glib_mainloop* m = NULL;
     pa_time_event *time_event = NULL;
-    int domid = -1;
-    char *pidfile_path;
-    int pidfile_fd;
-    int play_watch_fd, rec_watch_fd;
     int i;
 
     memset(&u, 0, sizeof(u));
@@ -1068,31 +1082,26 @@ int main(int argc, char *argv[])
     if (l_domid < 0 || l_domid >= 0x7FF0 || errno == ERANGE)
         errx(1, "domid %ld out of range 0 through %d inclusive", l_domid,
                 0x7FF0 - 1);
-    domid = l_domid;
+
     if (errno)
         err(1, "invalid domid %s", domid_str);
     if (*endptr)
         errx(1, "trailing junk after domid %s", domid_str);
-    if (create_pidfile(domid, &pidfile_path, &pidfile_fd) < 0)
-        /* error already printed by create_pidfile() */
-        exit(1);
-
+    
+    
+    u.domid = (int)l_domid;
+   
     u.ret = 1;
 
     g_mutex_init(&u.prop_mutex);
 
     u.name = domname;
 
-    u.play_ctrl = libvchan_client_init_async(domid, QUBES_PA_SINK_VCHAN_PORT, &play_watch_fd);
-    if (!u.play_ctrl) {
-        perror("libvchan_client_init_async");
+    if (init_vchan(&u)<0) {
+        perror("failed to initialize vchan");
         exit(1);
     }
-    u.rec_ctrl = libvchan_client_init_async(domid, QUBES_PA_SOURCE_VCHAN_PORT, &rec_watch_fd);
-    if (!u.rec_ctrl) {
-        perror("libvchan_client_init_async");
-        exit(1);
-    }
+
     if (setgid(getgid()) < 0) {
         perror("setgid");
         exit(1);
@@ -1126,14 +1135,14 @@ int main(int argc, char *argv[])
     }
 
     u.play_ctrl_event = u.mainloop_api->io_new(u.mainloop_api,
-            play_watch_fd, PA_IO_EVENT_INPUT, vchan_play_async_connect, &u);
+            u.play_watch_fd, PA_IO_EVENT_INPUT, vchan_play_async_connect, &u);
     if (!u.play_ctrl_event) {
         pacat_log("io_new play_ctrl failed");
         goto quit;
     }
 
     u.rec_ctrl_event = u.mainloop_api->io_new(u.mainloop_api,
-            rec_watch_fd, PA_IO_EVENT_INPUT, vchan_rec_async_connect, &u);
+            u.rec_watch_fd, PA_IO_EVENT_INPUT, vchan_rec_async_connect, &u);
     if (!u.rec_ctrl_event) {
         pacat_log("io_new rec_ctrl failed");
         goto quit;
@@ -1215,7 +1224,7 @@ quit:
 
     g_mutex_clear(&u.prop_mutex);
 
-    unlink(pidfile_path);
-    close(pidfile_fd);
+    unlink(u.pidfile_path);
+    close(u.pidfile_fd);
     return u.ret;
 }
