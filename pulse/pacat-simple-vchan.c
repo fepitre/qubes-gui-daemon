@@ -1041,15 +1041,142 @@ int init_vchan(struct userdata *u) {
         perror("libvchan_client_init_async");
         return -1;
     }
+
     return 0;
 }
 
+int setup_loop(struct userdata *u) {
+    struct timeval tv;
+    pa_glib_mainloop* m = NULL;
+
+    u->proplist = pa_proplist_new();
+    pa_proplist_sets(u->proplist, PA_PROP_APPLICATION_NAME, u->name);
+    pa_proplist_sets(u->proplist, PA_PROP_MEDIA_NAME, u->name);
+
+    g_mutex_clear(&u->prop_mutex);
+    g_mutex_init(&u->prop_mutex);
+
+    /* Set up a new main loop */
+    if (!(u->loop = g_main_loop_new (NULL, FALSE))) {
+        pacat_log("g_main_loop_new() failed.");
+        return -1;
+    }
+    if (!(m = pa_glib_mainloop_new(g_main_loop_get_context(u->loop)))) {
+        pacat_log("pa_glib_mainloop_new() failed.");
+        return -1;
+    }
+
+    u->mainloop_api = pa_glib_mainloop_get_api(m);
+    u->m = m;
+
+    pa_gettimeofday(&tv);
+    pa_timeval_add(&tv, (pa_usec_t) 5 * 1000 * PA_USEC_PER_MSEC);
+    u->time_event = u->mainloop_api->time_new(u->mainloop_api, &tv, check_vchan_eof_timer, u);
+    if (!u->time_event) {
+        pacat_log("time_event create failed");
+        return -1;
+    }
+
+    u->play_ctrl_event = u->mainloop_api->io_new(
+        u->mainloop_api, u->play_watch_fd, PA_IO_EVENT_INPUT, vchan_play_async_connect, u);
+    if (!u->play_ctrl_event) {
+        pacat_log("io_new play_ctrl failed");
+        return -1;
+    }
+
+    u->rec_ctrl_event = u->mainloop_api->io_new(
+        u->mainloop_api, u->rec_watch_fd, PA_IO_EVENT_INPUT, vchan_rec_async_connect, u);
+    if (!u->rec_ctrl_event) {
+        pacat_log("io_new rec_ctrl failed");
+        return -1;
+    }
+
+    u->rec_allowed = 0;
+
+    if (!(u->context = pa_context_new_with_proplist(u->mainloop_api, NULL, u->proplist))) {
+        pacat_log("pa_context_new() failed.");
+        return -1;
+    }
+
+    pa_context_set_state_callback(u->context, context_state_callback, u);
+
+    if (setup_control(u) < 0) {
+        pacat_log("control socket initialization failed");
+        return -1;
+    }
+
+    u->ret = 0;
+
+    return 0;
+}
+
+void cleanup_loop(struct userdata *u) {
+    pacat_log("going into cleanup loop");
+    if (u->control_socket_event) {
+        control_cleanup(u);
+    }
+
+    if (u->play_stream)
+        pa_stream_unref(u->play_stream);
+
+    if (u->rec_stream)
+        pa_stream_unref(u->rec_stream);
+
+    if (u->context)
+        pa_context_unref(u->context);
+
+    if (u->time_event) {
+        assert(u->mainloop_api);
+        u->mainloop_api->time_free(u->time_event);
+    }
+
+    if (u->play_ctrl_event) {
+        assert(u->mainloop_api);
+        u->mainloop_api->io_free(u->play_ctrl_event);
+    }
+
+    if (u->rec_ctrl_event) {
+        assert(u->mainloop_api);
+        u->mainloop_api->io_free(u->rec_ctrl_event);
+    }
+
+    /* discard remaining data */
+    if (libvchan_data_ready(u->play_ctrl)) {
+        char buf[2048];
+        libvchan_read(u->play_ctrl, buf, sizeof(buf));
+    }
+    if (libvchan_data_ready(u->rec_ctrl)) {
+        char buf[2048];
+        libvchan_read(u->rec_ctrl, buf, sizeof(buf));
+    }
+
+    /* close vchan */
+    if (u->play_ctrl) {
+        libvchan_close(u->play_ctrl);
+    }
+
+    if (u->rec_ctrl)
+        libvchan_close(u->rec_ctrl);
+
+    if (u->m) {
+        pa_signal_done();
+        pa_glib_mainloop_free(u->m);
+    }
+
+    if (u->proplist)
+        pa_proplist_free(u->proplist);
+
+    g_mutex_clear(&u->prop_mutex);
+
+    unlink(u->pidfile_path);
+    close(u->pidfile_fd);
+}
+
+
 int main(int argc, char *argv[])
 {
-    struct timeval tv;
+    
     struct userdata u;
-    pa_glib_mainloop* m = NULL;
-    pa_time_event *time_event = NULL;
     int i;
 
     memset(&u, 0, sizeof(u));
@@ -1088,19 +1215,6 @@ int main(int argc, char *argv[])
     if (*endptr)
         errx(1, "trailing junk after domid %s", domid_str);
     
-    
-    u.domid = (int)l_domid;
-   
-    u.ret = 1;
-
-    g_mutex_init(&u.prop_mutex);
-
-    u.name = domname;
-
-    if (init_vchan(&u)<0) {
-        perror("failed to initialize vchan");
-        exit(1);
-    }
 
     if (setgid(getgid()) < 0) {
         perror("setgid");
@@ -1110,121 +1224,21 @@ int main(int argc, char *argv[])
         perror("setuid");
         exit(1);
     }
-    u.proplist = pa_proplist_new();
-    pa_proplist_sets(u.proplist, PA_PROP_APPLICATION_NAME, u.name);
-    pa_proplist_sets(u.proplist, PA_PROP_MEDIA_NAME, u.name);
 
-    /* Set up a new main loop */
-    if (!(u.loop = g_main_loop_new (NULL, FALSE))) {
-        pacat_log("g_main_loop_new() failed.");
-        goto quit;
-    }
-    if (!(m = pa_glib_mainloop_new(g_main_loop_get_context(u.loop)))) {
-        pacat_log("pa_glib_mainloop_new() failed.");
-        goto quit;
+    u.ret = 1;
+    u.domid = (int)l_domid;
+    u.name = domname;
+
+    if (init_vchan(&u)<0) {
+        perror("failed to initialize vchan");
+        return u.ret;
     }
 
-    u.mainloop_api = pa_glib_mainloop_get_api(m);
-
-    pa_gettimeofday(&tv);
-    pa_timeval_add(&tv, (pa_usec_t) 5 * 1000 * PA_USEC_PER_MSEC);
-    time_event = u.mainloop_api->time_new(u.mainloop_api, &tv, check_vchan_eof_timer, &u);
-    if (!time_event) {
-        pacat_log("time_event create failed");
-        goto quit;
+    if (setup_loop(&u)<0) {
+        cleanup_loop(&u);
+        return u.ret;
     }
-
-    u.play_ctrl_event = u.mainloop_api->io_new(u.mainloop_api,
-            u.play_watch_fd, PA_IO_EVENT_INPUT, vchan_play_async_connect, &u);
-    if (!u.play_ctrl_event) {
-        pacat_log("io_new play_ctrl failed");
-        goto quit;
-    }
-
-    u.rec_ctrl_event = u.mainloop_api->io_new(u.mainloop_api,
-            u.rec_watch_fd, PA_IO_EVENT_INPUT, vchan_rec_async_connect, &u);
-    if (!u.rec_ctrl_event) {
-        pacat_log("io_new rec_ctrl failed");
-        goto quit;
-    }
-
-    u.rec_allowed = 0;
-
-    if (!(u.context = pa_context_new_with_proplist(u.mainloop_api, NULL, u.proplist))) {
-        pacat_log("pa_context_new() failed.");
-        goto quit;
-    }
-
-    pa_context_set_state_callback(u.context, context_state_callback, &u);
-
-    if (setup_control(&u) < 0) {
-        pacat_log("control socket initialization failed");
-        goto quit;
-    }
-
-    u.ret = 0;
 
     /* Run the main loop */
     g_main_loop_run (u.loop);
-
-quit:
-    if (u.control_socket_event) {
-        control_cleanup(&u);
-    }
-
-    if (u.play_stream)
-        pa_stream_unref(u.play_stream);
-
-    if (u.rec_stream)
-        pa_stream_unref(u.rec_stream);
-
-    if (u.context)
-        pa_context_unref(u.context);
-
-    if (time_event) {
-        assert(u.mainloop_api);
-        u.mainloop_api->time_free(time_event);
-    }
-
-    if (u.play_ctrl_event) {
-        assert(u.mainloop_api);
-        u.mainloop_api->io_free(u.play_ctrl_event);
-    }
-
-    if (u.rec_ctrl_event) {
-        assert(u.mainloop_api);
-        u.mainloop_api->io_free(u.rec_ctrl_event);
-    }
-
-    /* discard remaining data */
-    if (libvchan_data_ready(u.play_ctrl)) {
-        char buf[2048];
-        libvchan_read(u.play_ctrl, buf, sizeof(buf));
-    }
-    if (libvchan_data_ready(u.rec_ctrl)) {
-        char buf[2048];
-        libvchan_read(u.rec_ctrl, buf, sizeof(buf));
-    }
-
-    /* close vchan */
-    if (u.play_ctrl) {
-        libvchan_close(u.play_ctrl);
-    }
-
-    if (u.rec_ctrl)
-        libvchan_close(u.rec_ctrl);
-
-    if (m) {
-        pa_signal_done();
-        pa_glib_mainloop_free(m);
-    }
-
-    if (u.proplist)
-        pa_proplist_free(u.proplist);
-
-    g_mutex_clear(&u.prop_mutex);
-
-    unlink(u.pidfile_path);
-    close(u.pidfile_fd);
-    return u.ret;
 }

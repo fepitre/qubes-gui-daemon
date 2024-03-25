@@ -11,6 +11,7 @@
 
 struct userdata {
     pa_mainloop_api *mainloop_api;
+    pa_glib_mainloop *m;
     GMainLoop *loop;
     const char *name;
     int ret;
@@ -45,6 +46,7 @@ struct userdata {
     char *pidfile_path;
     int pidfile_fd;
     int play_watch_fd, rec_watch_fd;
+    pa_time_event *time_event;
 };
 
 void pacat_log(const char *fmt, ...);
