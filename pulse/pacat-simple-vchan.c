@@ -107,6 +107,9 @@ void pacat_log(const char *fmt, ...) {
 }
 
 
+int init_play_ctrl(struct userdata *u);
+int init_rec_ctrl(struct userdata *u);
+
 /* A shortcut for terminating the application */
 static void quit(struct userdata *u, int ret) {
     assert(u->loop);
@@ -407,8 +410,11 @@ static void vchan_play_callback(pa_mainloop_api *UNUSED(a),
 
     if (!libvchan_is_open(u->play_ctrl)) {
         pacat_log("vchan_is_eof");
-        start_drain(u, u->play_stream);
-        return;
+        if (init_play_ctrl(u)<0) {
+            perror("failed to restore play ctrl");
+            start_drain(u, u->play_stream);
+            return;
+        }
     }
 
     /* process playback data */
@@ -425,8 +431,11 @@ static void vchan_rec_callback(pa_mainloop_api *UNUSED(a),
 
     if (!libvchan_is_open(u->rec_ctrl)) {
         pacat_log("vchan_is_eof");
-        quit(u, 0);
-        return;
+        if (init_rec_ctrl(u)<0) {
+            perror("failed to restore rec ctrl");
+            quit(u, 0);
+            return;
+        }
     }
 
     /* process VM control command */
@@ -1026,19 +1035,34 @@ static _Noreturn void usage(char *arg0, int arg) {
     exit(arg);
 }
 
-int init_vchan(struct userdata *u) {
-    if (create_pidfile(u->domid, &u->pidfile_path, &u->pidfile_fd) < 0)
-        /* error already printed by create_pidfile() */
-        return -1;
-
+int init_play_ctrl(struct userdata *u) {
     u->play_ctrl = libvchan_client_init_async(u->domid, QUBES_PA_SINK_VCHAN_PORT, &u->play_watch_fd);
     if (!u->play_ctrl) {
         perror("libvchan_client_init_async");
         return -1;
     }
+
+    u->play_ctrl_event = u->mainloop_api->io_new(
+        u->mainloop_api, u->play_watch_fd, PA_IO_EVENT_INPUT, vchan_play_async_connect, u);
+    if (!u->play_ctrl_event) {
+        pacat_log("io_new play_ctrl failed");
+        return -1;
+    }
+
+    return 0;
+}
+
+int init_rec_ctrl(struct userdata *u) {
     u->rec_ctrl = libvchan_client_init_async(u->domid, QUBES_PA_SOURCE_VCHAN_PORT, &u->rec_watch_fd);
     if (!u->rec_ctrl) {
         perror("libvchan_client_init_async");
+        return -1;
+    }
+
+    u->rec_ctrl_event = u->mainloop_api->io_new(
+        u->mainloop_api, u->rec_watch_fd, PA_IO_EVENT_INPUT, vchan_rec_async_connect, u);
+    if (!u->rec_ctrl_event) {
+        pacat_log("io_new rec_ctrl failed");
         return -1;
     }
 
@@ -1048,6 +1072,10 @@ int init_vchan(struct userdata *u) {
 int setup_loop(struct userdata *u) {
     struct timeval tv;
     pa_glib_mainloop* m = NULL;
+
+    if (create_pidfile(u->domid, &u->pidfile_path, &u->pidfile_fd) < 0)
+        /* error already printed by create_pidfile() */
+        return -1;
 
     u->proplist = pa_proplist_new();
     pa_proplist_sets(u->proplist, PA_PROP_APPLICATION_NAME, u->name);
@@ -1077,17 +1105,13 @@ int setup_loop(struct userdata *u) {
         return -1;
     }
 
-    u->play_ctrl_event = u->mainloop_api->io_new(
-        u->mainloop_api, u->play_watch_fd, PA_IO_EVENT_INPUT, vchan_play_async_connect, u);
-    if (!u->play_ctrl_event) {
-        pacat_log("io_new play_ctrl failed");
+    if (init_play_ctrl(u)<0) {
+        perror("failed to initialize play ctrl");
         return -1;
     }
 
-    u->rec_ctrl_event = u->mainloop_api->io_new(
-        u->mainloop_api, u->rec_watch_fd, PA_IO_EVENT_INPUT, vchan_rec_async_connect, u);
-    if (!u->rec_ctrl_event) {
-        pacat_log("io_new rec_ctrl failed");
+    if (init_rec_ctrl(u)<0) {
+        perror("failed to initialize rec ctrl");
         return -1;
     }
 
@@ -1228,11 +1252,6 @@ int main(int argc, char *argv[])
     u.ret = 1;
     u.domid = (int)l_domid;
     u.name = domname;
-
-    if (init_vchan(&u)<0) {
-        perror("failed to initialize vchan");
-        return u.ret;
-    }
 
     if (setup_loop(&u)<0) {
         cleanup_loop(&u);
